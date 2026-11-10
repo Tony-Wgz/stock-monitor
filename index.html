@@ -222,7 +222,7 @@
 <div class="panel" id="panel-market">
   <div class="col-title">
     <span>大盘温度 <span class="meta">指数 · 宽度 · 资金 · 板块</span></span>
-    <span class="meta"><span id="mktTime">—</span> <button onclick="refreshMarket(true)" style="margin-left:8px">↻ 刷新</button></span>
+    <span class="meta"><span id="mktTime">—</span><span id="mktNext" class="dim" style="margin-left:8px"></span> <button onclick="refreshMarket(true)" style="margin-left:8px">↻ 刷新</button></span>
   </div>
   <div id="idxStrip" class="idx-strip"><span class="dim">加载中…</span></div>
   <div class="banner" id="mktBanner"><span class="dim">等数据…</span></div>
@@ -998,12 +998,27 @@ function onTick(){
   }
   renderHeader(st);
 
-  if (S.paused || !autoOn() || st.k !== 'open' || S.busy) { setStatus(); return; }
+  if (S.paused || !autoOn() || st.k !== 'open' || S.busy) { setStatus(); tickMarketNext(st); return; }
   S.countdown--;
   if (S.countdown <= 0) refreshMkt(false);
   else setStatus();
-  /* 大盘页签开着时，每 3 分钟顺手刷一次（快照本身有 3 分钟缓存） */
-  if ($('panel-market') && $('panel-market').classList.contains('active') && Date.now() - lastMarketTs > 180000) refreshMarket();
+  /* 大盘页签开着时自动刷新：交易中 60 秒，其余时段 5 分钟（报表本身有 3 分钟缓存，不会白打接口） */
+  if ($('panel-market') && $('panel-market').classList.contains('active')){
+    const iv = (st.k === 'open') ? 60000 : 300000;
+    if (Date.now() - lastMarketTs > iv) refreshMarket();
+  }
+  tickMarketNext(st);
+}
+
+/* 大盘右下角显示“下次刷新还有几秒”，让人看得出它在动 */
+function tickMarketNext(st){
+  const el = $('mktNext');
+  if (!el) return;
+  if (!lastMarketTs) { el.textContent = ''; return; }
+  if (st.k !== 'open'){ el.textContent = st.t + '，自动刷新已暂停'; return; }
+  if (!autoOn() || S.paused){ el.textContent = '自动刷新已关闭'; return; }
+  const left = Math.max(0, Math.ceil((60000 - (Date.now() - lastMarketTs)) / 1000));
+  el.textContent = left > 0 ? left + 's 后刷新' : '刷新中…';
 }
 
 function manualRefresh(){
@@ -2092,7 +2107,10 @@ async function styleSpread(){
 }
 
 let lastMarketTs = 0;
+let marketBusy = false;
 async function refreshMarket(force){
+  if (marketBusy) return;              // 防重入：上一次还没回来就跳过
+  marketBusy = true;
   const btn = $('mktTime');
   if (btn) btn.textContent = '刷新中…';
   try {
@@ -2128,6 +2146,9 @@ async function refreshMarket(force){
     $('mktTime').textContent = '更新 ' + nowHMS();
   } catch (e){
     $('mktTime').innerHTML = '<span class="red">失败：' + esc(e.message) + '</span>';
+  } finally {
+    marketBusy = false;
+    const n = $('mktNext'); if (n) n.textContent = '';
   }
 }
 function renderMarket(idx, st, sectors, trend, style, margin){
@@ -2652,7 +2673,7 @@ function showTab(key){
     $('panel-'+k).classList.toggle('active', k === key);
   });
   if (key === 'tech' && techState) setTimeout(() => drawChart(techState.ind, techState.rows), 30);
-  if (key === 'market' && !lastMarketTs) refreshMarket();
+  if (key === 'market' && Date.now() - lastMarketTs > 30000) refreshMarket();   // 切回大盘时若超过 30 秒就刷
 }
 function start(){
   initNotifyBtn();
