@@ -164,6 +164,7 @@
   <button id="btnNotify" onclick="askNotify()" style="display:none">开启桌面通知</button>
   <button id="btnPause" onclick="togglePause()">暂停</button>
   <button onclick="exportCSV()">导出CSV</button>
+  <button onclick="copyReviewMd()" title="生成一份复盘 Markdown 并复制/下载">生成复盘</button>
 </div>
 
 <div class="statusbar">
@@ -239,7 +240,7 @@
   </div>
   <div class="hint">
     <b>宽度</b>用东财指数自带的涨跌家数（<code>f104/f105/f106</code>，沪市+深市+北交所，一次请求拿全）；<br>
-    <b>涨停/跌停</b>按板别涨跌幅上限近似判定（主板 10%、双创 20%、北交所 30%，ST 未单独处理），是<b>近似值</b>，不是交易所口径；<br>
+    <b>涨停/跌停</b>按「现价是否贴住由昨收算出的限价」判定（主板 10%、双创 20%、北交所 30%，ST 同时试 5% 与 10%），仍是<b>近似值</b>，非交易所权威口径；<br>
     <b>资金</b>=全市场主力净额合计（东财 f62 汇总）；<b>成交额</b>=沪深两市指数成交额；<br>
     <b>结论</b>是按阈值规则拼出来的，不是模型观点——你可以看下面的原始数字自己判断。
   </div>
@@ -397,10 +398,66 @@ const isMain = c => MAIN_RE.test(String(c));
 const isST   = n => /ST/i.test(n || '');
 
 /* 市场状态机：周末 / 未开盘 / 交易中 / 午间休市 / 已收盘 */
+/* ---- 交易日历（深交所官网，CORS 开放）----
+   目的：区分「周末休市」和「工作日休市」（国庆/春节等）。
+   加载失败时退回原来的星期判断，绝不阻断主流程。 */
+function ymKey(d){ return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
+function isoOf(d){ return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+
+function readCalCache(m){
+  try {
+    const raw = localStorage.getItem('dd_cal_' + m);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (Date.now() - o.t > 12 * 3600 * 1000) return null;      // 12 小时过期
+    if (!Array.isArray(o.d) || !o.d.length) return null;        // 缓存过坏不用
+    return o.d;
+  } catch (e) { return null; }
+}
+function writeCalCache(m, days){
+  try { localStorage.setItem('dd_cal_' + m, JSON.stringify({ t: Date.now(), d: days })); } catch (e) {}
+}
+
+async function fetchMonthCalendar(m){
+  const cached = readCalCache(m);
+  if (cached) return cached;
+  const url = 'https://www.szse.cn/api/report/exchange/onepersistenthour/monthList?month=' + encodeURIComponent(m);
+  const r = await fetch(url, { signal: AbortSignal.timeout(9000) });
+  if (!r.ok) throw new Error('日历 HTTP ' + r.status);
+  const j = await r.json();
+  const rows = (j && j.data) || [];
+  if (!rows.length) throw new Error('日历为空');
+  const days = rows.filter(x => String(x.jybz) === '1' && x.jyrq).map(x => String(x.jyrq).slice(0, 10));
+  if (!days.length) throw new Error('日历无交易日');
+  writeCalCache(m, days);
+  return days;
+}
+
+async function loadCalendar(){
+  const now = new Date();
+  const months = [ymKey(now)];
+  const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  if (now.getDate() >= lastDay - 2) months.push(ymKey(new Date(now.getFullYear(), now.getMonth() + 1, 1)));
+  const set = new Set();
+  let ok = false;
+  for (const m of months){
+    try {
+      (await fetchMonthCalendar(m)).forEach(d => set.add(d));
+      ok = true;
+    } catch (e) { /* 单月失败不影响另一月 */ }
+  }
+  if (!ok) { S.cal = null; return false; }        // 全失败 → 退回星期判断
+  S.cal = set;
+  return true;
+}
+
 function marketState(){
   const d = new Date(), w = d.getDay();
   const m = d.getHours()*60 + d.getMinutes();
   if (w === 0 || w === 6) return { k: 'weekend', t: '休市 · 周末', cls: 'dim' };
+  /* 工作日但不在交易日历里 → 节假日休市（只在日历加载成功后判定） */
+  if (S.cal && S.cal.size && !S.cal.has(isoOf(d)))
+    return { k: 'holiday', t: '休市 · 节假日', cls: 'dim' };
   if (m < 555)  return { k: 'pre',    t: '未开盘',       cls: 'dim' };
   if (m < 690)  return { k: 'open',   t: '交易中',       cls: 'red' };
   if (m < 780)  return { k: 'lunch',  t: '午间休市',     cls: 'amber' };
@@ -420,7 +477,25 @@ function fastMode(){        /* 早盘 9:30~10:00 */
    ================================================================ */
 const UT = 'fa5fd1943c7b386f172d6893dbfba10b';
 let __jp = 0;
-function jsonp(url, cbParam, timeout){
+let emQuoteDownUntil = 0;   // 东财报价熔断到期时间：一批失败后本轮直接走腾讯
+/* 网络层重试：东财 push2/push2his 会间歇性直接断连（相同请求时好时坏）。
+   只对「网络错误 / 超时」重试，业务错误（回调里带 error）不重试。 */
+async function jsonp(url, cbParam, timeout){
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++){
+    try {
+      return await jsonpOnce(url, cbParam, timeout);
+    } catch (e){
+      lastErr = e;
+      const retriable = /网络错误|超时/.test(e.message || '');
+      if (!retriable || attempt === 2) break;
+      await new Promise(r => setTimeout(r, 350 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+function jsonpOnce(url, cbParam, timeout){
   cbParam = cbParam || 'cb'; timeout = timeout || 12000;
   return new Promise((resolve, reject) => {
     const name = '__jp' + (++__jp) + '_' + Date.now();
@@ -525,9 +600,40 @@ async function mapLimit(items, limit, fn){
   return out;
 }
 async function quoteBatch(codes){
+  /* 熔断：东财刚失败过 → 直接走腾讯，不再逐批等超时 */
+  if (Date.now() < emQuoteDownUntil){
+    const stocks = codes.filter(c => /^\d{6}$/.test(c));
+    const m0 = new Map();
+    if (stocks.length){
+      try {
+        const tq = await quoteBatchTencent(stocks);
+        tq.forEach((v, k) => m0.set(k, v));
+        if (m0.size) S.quoteSource = '腾讯兜底';
+        return m0;
+      } catch (e) { return m0; }
+    }
+    return m0;
+  }
   const parts = chunk(codes, 200);
-  const res = await mapLimit(parts, 4, p => jsonp(
-    P2 + '/api/qt/ulist.np/get?ut=' + UT + '&fltt=2&secids=' + p.map(secidOf).join(',') + '&fields=' + QFIELDS, 'cb'));
+  /* 单批失败重试 2 次（间隔 400/800ms）：东财在密集请求下会 reset 连接，
+     不重试会导致整批行情丢失，进而让实时兜底静默退回旧报表。 */
+  const one = async (p) => {
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++){
+      try {
+        return await jsonp(P2 + '/api/qt/ulist.np/get?ut=' + UT + '&fltt=2&secids='
+          + p.map(secidOf).join(',') + '&fields=' + QFIELDS, 'cb');
+      } catch (e) {
+        lastErr = e;
+        emQuoteDownUntil = Date.now() + 90000;   // 熔断 90 秒
+        if (attempt < 1) await new Promise(r => setTimeout(r, 300));
+      }
+    }
+    throw lastErr;
+  };
+  const res = await mapLimit(parts, 3, async p => {
+    try { return await one(p); } catch (e) { return null; }   // 单批彻底失败 → 跳过，不拖垮整轮
+  });
   const map = new Map();
   res.forEach(d => {
     const diff = d && d.data && d.data.diff;
@@ -544,21 +650,115 @@ async function quoteBatch(codes){
       });
     });
   });
+
+  /* 东财整批失败 → 自动改走腾讯（仅正股，无主力净额） */
+  if (map.size === 0){
+    const stocks = codes.filter(c => /^\d{6}$/.test(c));
+    if (stocks.length){
+      try {
+        const tq = await quoteBatchTencent(stocks);
+        if (tq.size) { tq.forEach((v, k) => map.set(k, v)); S.quoteSource = '腾讯兜底'; }
+      } catch (e) { /* 两路都失败 */ }
+    }
+  }
   return map;
+}
+/* 腾讯报价兜底：东财 push2 整体不可用时，至少把价格/涨跌幅拉回来。
+   腾讯接口返回 `v_sz002008="..."` 形式的 JS 赋值，用 <script> 标签可跨域读取。
+   注意：腾讯没有「主力净额」，这一项只能用日报（dcRank）的值或留空。 */
+function quoteBatchTencent(codes){
+  const prefixOf = c => (/^(6|9)/.test(c) ? 'sh' : /^(4|8)/.test(c) ? 'bj' : 'sz');
+  const parts = chunk(codes, 200);
+  return mapLimit(parts, 6, p => new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    const timer = setTimeout(() => { cleanup(); reject(new Error('腾讯超时')); }, 12000);
+    function cleanup(){ clearTimeout(timer); try { s.remove(); } catch(e){} }
+    s.charset = 'gbk';
+    s.src = 'https://qt.gtimg.cn/q=' + p.map(c => prefixOf(c) + c).join(',');
+    s.onload = () => {
+      cleanup();
+      const out = [];
+      p.forEach(c => {
+        const raw = window['v_' + prefixOf(c) + c];
+        if (!raw) return;
+        const f = String(raw).split('~');
+        if (f.length < 50) return;
+        const num = v => (v === '' || v === '-' ? null : +v);
+        out.push({
+          code: c, name: f[1], price: num(f[3]), pct: num(f[32]),
+          chg: num(f[31]), open: num(f[5]), high: num(f[33]), low: num(f[34]),
+          preclose: num(f[4]),
+          vol: num(f[6]), amount: num(f[37]) != null ? num(f[37]) * 1e4 : null,
+          turn: num(f[38]), pe: num(f[39]), pb: num(f[46]),
+          mcap: num(f[45]) != null ? num(f[45]) * 1e8 : null,
+          floatMcap: num(f[44]) != null ? num(f[44]) * 1e8 : null,
+          volRatioQ: num(f[49]),
+          main: null, sup: null, big: null, mainPct: null,
+          src: 'tencent'
+        });
+      });
+      resolve(out);
+    };
+    s.onerror = () => { cleanup(); reject(new Error('腾讯失败')); };
+    (document.body || document.head).appendChild(s);
+  })).then(groups => {
+    const m = new Map();
+    groups.forEach(g => (g || []).forEach(q => m.set(q.code, q)));
+    return m;
+  });
 }
 
 /* 3.4 K 线（push2his，注意 lmt 不生效，取回后自己切） */
+/* 日 K 腾讯兜底：东财 push2his 不可用时使用。仅支持日线（klt=101）。 */
+function klineTencent(code, lim){
+  return new Promise((resolve, reject) => {
+    const pre = /^(6|9)/.test(String(code)) ? 'sh' : 'sz';
+    const vname = 'kline_tq_' + Date.now();
+    const s = document.createElement('script');
+    const timer = setTimeout(() => { cleanup(); reject(new Error('K线超时')); }, 12000);
+    function cleanup(){ clearTimeout(timer); try { s.remove(); } catch(e){} }
+    s.charset = 'gbk';
+    s.src = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?_var=' + vname
+          + '&param=' + pre + code + ',day,,,' + Math.max(60, lim || 250) + ',qfq';
+    s.onload = () => {
+      cleanup();
+      try {
+        const d = window[vname];
+        const node = d && d.data && d.data[pre + code];
+        const arr = (node && (node.qfqday || node.day)) || [];
+        const rows = arr.map(a => ({ t: a[0], o: +a[1], c: +a[2], h: +a[3], l: +a[4], v: +a[5], a: null, pct: null, turn: null }));
+        for (let i = 1; i < rows.length; i++){
+          const prev = rows[i-1].c;
+          if (prev) rows[i].pct = +(((rows[i].c - prev) / prev) * 100).toFixed(2);
+        }
+        try { delete window[vname]; } catch(e) { window[vname] = undefined; }
+        resolve({ name: '', code: code, rows: rows, src: 'tencent' });
+      } catch (e) { reject(e); }
+    };
+    s.onerror = () => { cleanup(); reject(new Error('K线失败')); };
+    (document.body || document.head).appendChild(s);
+  });
+}
+
 async function kline(code, klt, lim){
   klt = klt || 101; lim = lim || 250;
-  const d = await jsonp(P2H + '/api/qt/stock/kline/get?secid=' + secidOf(code) + '&ut=' + UT
-      + '&klt=' + klt + '&fqt=1&beg=0&end=20500101&lmt=' + (lim + 5)
-      + '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61', 'cb');
-  const data = (d && d.data) || {};
-  const rows = (data.klines || []).map(line => {
-    const p = line.split(',');
-    return { t: p[0], o: +p[1], c: +p[2], h: +p[3], l: +p[4], v: +p[5], a: +p[6], pct: +p[8], turn: +p[10] };
-  });
-  return { name: data.name, code: data.code, rows: rows.slice(-lim) };
+  /* 东财优先；不可用时退到腾讯日 K（仅日线） */
+  try {
+    const d = await jsonp(P2H + '/api/qt/stock/kline/get?secid=' + secidOf(code) + '&ut=' + UT
+        + '&klt=' + klt + '&fqt=1&beg=0&end=20500101&lmt=' + (lim + 5)
+        + '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61', 'cb');
+    const data = (d && d.data) || {};
+    const rows = (data.klines || []).map(line => {
+      const p = line.split(',');
+      return { t: p[0], o: +p[1], c: +p[2], h: +p[3], l: +p[4], v: +p[5], a: +p[6], pct: +p[8], turn: +p[10] };
+    });
+    if (rows.length) return { name: data.name, code: data.code, rows: rows.slice(-lim) };
+    throw new Error('东财K线为空');
+  } catch (e) {
+    if (+klt !== 101) throw e;                 // 分钟线腾讯兜底未实现，直接抛
+    const k = await klineTencent(code, lim);
+    return { name: k.name, code: k.code, rows: k.rows.slice(-lim), src: 'tencent' };
+  }
 }
 
 /* 3.5 腾讯分笔（单页） */
@@ -702,6 +902,7 @@ function calcIndicators(rows){
    5. 状态
    ================================================================ */
 const S = {
+  cal: null,            // 交易日集合（深交所日历），null=未加载/加载失败
   paused: false,
   busy: false,
   snapshots: [],        // [{t, m:Map(code->f62)}]
@@ -771,9 +972,36 @@ async function refreshMkt(manual){
       S.dataDate = dd;
     }
 
-    const qmap = await quoteBatch(codes);
+    /* 日报里的主力净额（来自 datacenter，和 push2 是两条路）先存一份：
+       东财实时接口挂掉时，至少主力还能显示日报值，且要标注。 */
+    if (snapAll && snapAll.length){
+      if (!S.mainCache) S.mainCache = new Map();
+      let n = 0;
+      snapAll.forEach(r => { if (r.main != null){ S.mainCache.set(r.code, r.main); n++; } });
+      S.mainFromReport = n > 0;
+    }
+
+    let qmap = new Map();
+    try { qmap = await quoteBatch(codes); } catch (e) { qmap = new Map(); }
     S.reqCount += Math.ceil(codes.length / 200);
 
+    /* 东财不可用时，腾讯补价格；主力一律走 mainCache（来自日报或上一轮实时值） */
+    if (qmap.size < Math.max(20, Math.floor(codes.length * 0.5))){
+      try {
+        const tq = await quoteBatchTencent(codes);
+        tq.forEach((q, c) => { if (!qmap.has(c)) qmap.set(c, q); });
+      } catch (e2) { /* 两路都失败 */ }
+    }
+
+    if (!S.mainCache) S.mainCache = new Map();
+    let fromTencent = 0, liveMain = 0;
+    qmap.forEach((q, c) => {
+      if (q.main != null){ S.mainCache.set(c, q.main); liveMain++; }
+      else if (S.mainCache.has(c)) q.main = S.mainCache.get(c);
+      if (q.src === 'tencent') fromTencent++;
+    });
+    S.quoteSource = liveMain > 0 ? '东财' : (fromTencent > 0 ? '腾讯兜底' : '东财');
+    S.quoteAt = Date.now();          // 报价确实刷新过 → 说明市场在交易，不能判「疑似休市」
     const rows = [];
     qmap.forEach(q => {
       if (!q || q.price == null) return;
@@ -794,6 +1022,7 @@ async function refreshMkt(manual){
     S.countdown = Math.max(15, +$('interval').value || 60);
     const modeTxt = mode === 'full' ? '全主板' : '候选池';
     S.summary = '<b>' + rows.length + '</b> 只 · ' + modeTxt + ' · ' + S.reqCount + ' 请求'
+      + (S.quoteSource === '腾讯兜底' ? ' · <span style="color:#e0a030">腾讯兜底·主力为日报值</span>' : '')
                 + (S.liveMode ? ' · <span class="amber" style="font-size:11px">实时兜底</span>' : '');
   } catch (e){
     S.lastErr = e.message;
@@ -830,6 +1059,121 @@ function deltaOf(code){
   return now.m.get(code) - base.m.get(code);
 }
 
+/* ============ 复盘报告（基于当前页面数据生成 Markdown） ============ */
+async function buildReviewMd(){
+  const st = marketState();
+  const snap = await marketSnapshot(false);
+  const stats = marketStats(snap);
+  if (!S.idx || !S.idx.length){ try { S.idx = await indexQuotes(); } catch(e){} }
+  const idx = S.idx || [];
+  const d = isoToday();
+  const L = [];
+  L.push(`# 大单监控复盘 ${d}`);
+  L.push('');
+  L.push(`> 生成于 ${new Date().toLocaleString('zh-CN', {hour12:false})} · 数据源 ${S.liveMode ? '实时全扫' : (S.snapDate || '日报')}${S.quoteSource === '腾讯兜底' ? '（腾讯兜底）' : ''}`);
+  L.push('');
+  L.push('## 一、指数');
+  if (idx.length){
+    for (const x of idx) L.push(`- ${x.name} ${x.price} ${x.pct > 0 ? '+' : ''}${x.pct}%`);
+  } else L.push('- （未取到指数）');
+  L.push('');
+  L.push('## 二、宽度');
+  L.push(`- 涨 ${stats.up} / 跌 ${stats.down} / 平 ${stats.flat} · 涨停 ${stats.lu} / 跌停 ${stats.ld}`);
+  L.push(`- 中位涨幅 ${stats.median}% · 主力净额 ${(stats.mainSum/1e8).toFixed(1)} 亿`);
+  if (stats.conclusion) L.push(`- 结论：${stats.conclusion}`);
+  L.push('');
+  const secs = (S.sectors || []).slice(0, 5);
+  if (secs.length){
+    L.push('## 三、板块资金');
+    for (const x of secs) L.push(`- ${x.name} ${(x.main/1e8).toFixed(1)}亿（${x.pct}%）`);
+    L.push('');
+  }
+  const picks = (typeof getScreenRows === 'function' ? getScreenRows() : []).slice(0, 5);
+  if (picks.length){
+    L.push('## 四、选股（主力加速）');
+    for (const r of picks) L.push(`- ${r.name}（${r.code}）评分 ${r.score.toFixed(1)} · 主力 ${(r.main/1e8).toFixed(2)}亿 · ${r.pct}%`);
+    L.push('');
+  }
+  if ((S.rows || []).length){
+    const top = S.rows.slice().sort((a,b)=>(b.main||-1e18)-(a.main||-1e18)).slice(0, 5);
+    L.push('## 五、主力净额前五');
+    for (const r of top) L.push(`- ${r.name}（${r.code}）${r.main == null ? '--' : (r.main/1e8).toFixed(2) + '亿'} · ${r.pct}%`);
+    L.push('');
+  }
+  L.push('---');
+  L.push('*本报告由大单监控 Pro 自动生成，仅供研究参考，不构成投资建议。*');
+  return L.join('\n');
+}
+
+/* 生成复盘：先在页面里弹出来（手机能直接看、能选字），再决定复制/分享/下载 */
+async function copyReviewMd(){
+  try {
+    toast('正在生成复盘…');
+    const md = await buildReviewMd();
+    showReviewModal(md);
+  } catch (e) {
+    toast('生成失败：' + e.message);
+  }
+}
+
+function showReviewModal(md){
+  let mask = document.getElementById('rvMask');
+  if (mask) mask.remove();
+  mask = document.createElement('div');
+  mask.id = 'rvMask';
+  mask.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:9999;display:flex;align-items:center;justify-content:center;padding:12px';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#16161a;border:1px solid #2a2a32;border-radius:12px;width:min(760px,100%);max-height:88vh;display:flex;flex-direction:column;overflow:hidden';
+
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #2a2a32;flex:0 0 auto';
+  head.innerHTML = '<b style="font-size:14px">复盘报告</b><span style="color:#8a8a96;font-size:12px">' + md.length + ' 字符</span>';
+
+  const body = document.createElement('pre');
+  body.textContent = md;
+  body.style.cssText = 'margin:0;padding:14px;overflow:auto;flex:1 1 auto;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.65;color:#d7d7de;font-family:ui-monospace,Consolas,monospace;user-select:text;-webkit-user-select:text';
+
+  const bar = document.createElement('div');
+  bar.style.cssText = 'display:flex;gap:8px;padding:10px 14px;border-top:1px solid #2a2a32;flex:0 0 auto;flex-wrap:wrap';
+
+  const mkBtn = (label, fn, primary) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.style.cssText = 'flex:1 1 auto;min-width:88px;padding:9px 12px;border-radius:8px;font-size:13px;cursor:pointer;border:1px solid '
+      + (primary ? '#c8323c' : '#3a3a44') + ';background:' + (primary ? '#c8323c' : '#22222a') + ';color:#fff';
+    b.onclick = fn;
+    return b;
+  };
+
+  bar.appendChild(mkBtn('复制全文', async () => {
+    try { await navigator.clipboard.writeText(md); toast('已复制到剪贴板'); }
+    catch (e) { toast('复制失败，请长按选中文字'); }
+  }, true));
+
+  if (navigator.share){
+    bar.appendChild(mkBtn('分享', async () => {
+      try { await navigator.share({ title: '复盘 ' + isoToday(), text: md }); }
+      catch (e) { /* 用户取消 */ }
+    }));
+  }
+
+  bar.appendChild(mkBtn('下载', () => {
+    const blob = new Blob([md], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '复盘_' + isoToday() + '.md';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  }));
+
+  bar.appendChild(mkBtn('关闭', () => mask.remove()));
+
+  box.appendChild(head); box.appendChild(body); box.appendChild(bar);
+  mask.appendChild(box);
+  mask.onclick = e => { if (e.target === mask) mask.remove(); };
+  (document.body || document.documentElement).appendChild(mask);
+}
+
 function renderMkt(){
   const rows = S.rows.slice();
   rows.forEach(r => { r.d5 = deltaOf(r.code); });
@@ -838,7 +1182,7 @@ function renderMkt(){
   const by = (byReq === 'delta' && !hasDelta) ? 'main' : byReq;    // 还没攒够窗口 → 先按主力净额看
   const lim = +$('rowLimit').value;
   const sorted = rows.filter(r => by === 'main' || r.d5 != null)
-                     .sort((a,b) => by === 'main' ? (b.main - a.main) : (b.d5 - a.d5))
+                     .sort((a,b) => by === 'main' ? ((b.main == null ? -Infinity : b.main) - (a.main == null ? -Infinity : a.main)) : ((b.d5 == null ? -Infinity : b.d5) - (a.d5 == null ? -Infinity : a.d5)))
                      .slice(0, lim);
 
   const wl = (S.spanMs && by === 'delta') ? Math.max(1, Math.round(S.spanMs / 60000)) + '分'
@@ -954,9 +1298,11 @@ function renderHeader(st){
   st = st || marketState();
   const dd = S.dataDate || S.snapDate || '—';
   const stale = !!S.dataDate && S.dataDate !== isoToday();
-  /* 交易时段里数据日却不是今天 → 大概率是节假日休市（周末已被状态机排除） */
+  /* 报价刚成功刷新过 → 市场在交易，即使「主力日」还是上一交易日也不能判休市。
+     主力净额来自东财日报（收盘后才更新），它慢一天是正常的。 */
   const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
-  const suspect = st.k === 'open' && stale && nowMin > 9 * 60 + 35;
+  const quotesLive = !!S.quoteAt && (Date.now() - S.quoteAt < 3 * 60 * 1000);
+  const suspect = st.k === 'open' && stale && !quotesLive && nowMin > 9 * 60 + 35;
   S.suspectHoliday = suspect;
   if (suspect){
     $('mkState').textContent = '疑似休市';
@@ -965,9 +1311,13 @@ function renderHeader(st){
     $('mkState').textContent = st.t;
     $('mkState').className = 'pill ' + st.cls;
   }
-  $('dataDate').innerHTML = S.liveMode
-    ? '行情 <b class="red">实时</b> <span class="dim" title="东财日频报表（全市场快照 / 行业资金流）还没生成今日数据；工具已自动改用 ulist 实时全扫 + 实时板块，页面上的涨跌家数、涨停数、资金、板块均为当日实时值。">· 日报未更新（已自动用实时数据）</span>'
-    : ('数据日 <b>' + dd + '</b>' + (stale ? ' <span class="amber">非当日</span>' : ''));
+  if (S.liveMode){
+    $('dataDate').innerHTML = '行情 <b class="red">实时</b> <span class="dim" title="东财日频报表（全市场快照 / 行业资金流）还没生成今日数据；工具已自动改用 ulist 实时全扫 + 实时板块，页面上的涨跌家数、涨停数、资金、板块均为当日实时值。">· 日报未更新（已自动用实时数据）</span>';
+  } else if (quotesLive && dd !== '—' && dd !== isoToday()){
+    $('dataDate').innerHTML = '行情 <b class="red">实时</b> <span class="dim">· 主力为 ' + dd + ' 日报值</span>';
+  } else {
+    $('dataDate').innerHTML = '数据日 <b>' + dd + '</b>' + (stale ? ' <span class="amber">非当日</span>' : '');
+  }
   $('lastUpdate').textContent = S.lastUpdate ? '最后刷新 ' + hmsOf(S.lastUpdate) : '尚未刷新';
 }
 function setStatus(){
@@ -1005,6 +1355,7 @@ function onTick(){
   /* 大盘页签开着时自动刷新：交易中 60 秒，其余时段 5 分钟（报表本身有 3 分钟缓存，不会白打接口） */
   if ($('panel-market') && $('panel-market').classList.contains('active')){
     const iv = (st.k === 'open') ? 60000 : 300000;
+    if (st.k === 'holiday' || st.k === 'weekend') { tickMarketNext(st); return; }
     if (Date.now() - lastMarketTs > iv) refreshMarket();
   }
   tickMarketNext(st);
@@ -1860,6 +2211,8 @@ async function dcSnapshot(force){
   const pages = r0.pages || 1;
   const rows = (r0.data || []).map(mapSnapRow);
   const rest = [];
+  // 日报是全市场主力净额的唯一非 push2 来源，先存下来供降级用
+  if (rows.length){ S.mainCache = new Map(); rows.forEach(r => { if (r.main != null) S.mainCache.set(r.code, r.main); }); }
   for (let p = 2; p <= pages; p++) rest.push(p);
   const parts = await mapLimit(rest, 4, p => jsonp(base + p, 'callback').catch(() => null));
   parts.forEach(d => { if (d && d.result && d.result.data) d.result.data.forEach(r => rows.push(mapSnapRow(r))); });
@@ -1875,10 +2228,14 @@ async function liveSnapshot(force){
   if (!S.universeAll) S.universeAll = await dcUniverse(true);
   const qmap = await quoteBatch(S.universeAll);
   const rows = [];
+  if (!S.mainCache) S.mainCache = new Map();
   qmap.forEach(q => {
     if (q.price == null) return;
+    // 腾讯兜底时没有主力净额 → 用日报（mainCache）补，保证排序/选股在降级模式下仍可用
+    let main = q.main, mainPct = q.mainPct;
+    if (main == null && S.mainCache.has(q.code)) main = S.mainCache.get(q.code);
     rows.push({ code: q.code, name: q.name, price: q.price, pct: q.pct,
-                turn: q.turn, main: q.main, mainPct: q.mainPct, mcap: q.mcap });
+                turn: q.turn, main: main, mainPct: mainPct, mcap: q.mcap });
   });
   CACHE.mem.set('live', { t: Date.now(), v: rows });
   return rows;
@@ -1891,29 +2248,76 @@ async function marketSnapshot(force){
   if (stale && (sk === 'open' || sk === 'lunch' || sk === 'closed')){
     try {
       const live = await liveSnapshot(force);
-      if (live.length > 1000){ S.liveMode = true; S.dataDate = isoToday(); return live; }
+      if (live.length > 1000){ S.liveMode = true; S.dataDate = isoToday(); S.liveCount = live.length; return live; }
     } catch(e){ /* 兜底失败就退回报表，至少不崩 */ }
   }
   S.liveMode = false;
   return rows;
 }
+/* 指数行情：东财优先，push2 不可用时退到腾讯（涨跌家数只有东财有，腾讯兜底时为空） */
 async function indexQuotes(){
-  const d = await jsonp(P2 + '/api/qt/ulist.np/get?ut=' + UT + '&fltt=2&secids='
-      + IDX_LIST.map(x => x[0]).join(',') + '&fields=f2,f3,f6,f12,f14,f104,f105,f106', 'cb');
-  const out = [];
-  ((d && d.data && d.data.diff) || []).forEach(x => out.push({
-    code: x.f12, name: x.f14, price: x.f2, pct: x.f3, amount: x.f6,
-    up: x.f104, down: x.f105, flat: x.f106
-  }));
-  return out;
+  try {
+    const d = await jsonp(P2 + '/api/qt/ulist.np/get?ut=' + UT + '&fltt=2&secids='
+        + IDX_LIST.map(x => x[0]).join(',') + '&fields=f2,f3,f6,f12,f14,f104,f105,f106', 'cb');
+    const out = [];
+    ((d && d.data && d.data.diff) || []).forEach(x => out.push({
+      code: x.f12, name: x.f14, price: x.f2, pct: x.f3, amount: x.f6,
+      up: x.f104, down: x.f105, flat: x.f106
+    }));
+    if (out.length) return out;
+    throw new Error('东财指数为空');
+  } catch (e) {
+    return await indexQuotesTencent();
+  }
+}
+
+function indexQuotesTencent(){
+  const syms = ['sh000001','sz399001','sz399006','sh000688','sh000300','sh000852','bj899050'];
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    const timer = setTimeout(() => { cleanup(); reject(new Error('指数超时')); }, 12000);
+    function cleanup(){ clearTimeout(timer); try { s.remove(); } catch(e){} }
+    s.charset = 'gbk';
+    s.src = 'https://qt.gtimg.cn/q=' + syms.join(',');
+    s.onload = () => {
+      cleanup();
+      const out = [];
+      syms.forEach(sym => {
+        const raw = window['v_' + sym];
+        if (!raw) return;
+        const f = String(raw).split('~');
+        if (f.length < 40) return;
+        out.push({ code: sym.slice(2), name: f[1], price: +f[3], pct: +f[32],
+                   amount: (+f[37] || 0) * 1e4, up: null, down: null, flat: null, src: 'tencent' });
+      });
+      resolve(out);
+    };
+    s.onerror = () => { cleanup(); reject(new Error('指数失败')); };
+    (document.body || document.head).appendChild(s);
+  });
 }
 async function dcSectors(date){
-  const filt = encodeURIComponent("(TRADE_DATE='" + date + "')");
-  const d = await jsonp(DC + '?reportName=RPT_INDUSTRY_FUNDFLOW'
-      + '&columns=BOARD_CODE,BOARD_NAME,CHANGE_RATE,NET_INFLOW,NET_INFLOW_RATIO'
-      + '&pageSize=200&sortColumns=NET_INFLOW&sortTypes=-1&filter=' + filt, 'callback');
-  const rows = (d && d.result && d.result.data) || [];
-  return rows.map(r => ({ code: r.BOARD_CODE, name: r.BOARD_NAME, pct: r.CHANGE_RATE, net: r.NET_INFLOW }));
+  /* 该报表收盘后才发布；当日没有就往前找最近一个有数据的交易日。
+     找到的日期写进 S.sectorDate，界面据此标注「数据日期」。 */
+  const base = new Date(String(date).replace(/-/g, '/'));
+  for (let i = 0; i < 6; i++){
+    const d0 = new Date(base.getTime() - i * 86400000);
+    if (d0.getDay() === 0 || d0.getDay() === 6) continue;
+    const ds = isoOf(d0);
+    const filt = encodeURIComponent("(TRADE_DATE='" + ds + "')");
+    try {
+      const d = await jsonp(DC + '?reportName=RPT_INDUSTRY_FUNDFLOW'
+          + '&columns=BOARD_CODE,BOARD_NAME,CHANGE_RATE,NET_INFLOW,NET_INFLOW_RATIO'
+          + '&pageSize=200&sortColumns=NET_INFLOW&sortTypes=-1&filter=' + filt, 'callback');
+      const rows = (d && d.result && d.result.data) || [];
+      if (rows.length){
+        S.sectorDate = ds;
+        return rows.map(r => ({ code: r.BOARD_CODE, name: r.BOARD_NAME, pct: r.CHANGE_RATE, net: r.NET_INFLOW }));
+      }
+    } catch (e) { /* 换前一天再试 */ }
+  }
+  S.sectorDate = null;
+  return [];
 }
 /* 板别涨跌幅上限：主板 10%、ST 5%、双创 20%、北交所 30%
    （新股上市首日不设限，属已知近似，不单独处理） */
@@ -1923,8 +2327,27 @@ function limitPctOf(code, name){
   if (/^(30|68)/.test(c)) return 20;          // 双创即使 ST 也是 20%
   return /ST/i.test(name || '') ? 5 : 10;     // 主板 ST 为 5%
 }
-const isLimitUp   = r => r.pct != null && r.pct >= limitPctOf(r.code, r.name) - 0.35;
-const isLimitDown = r => r.pct != null && r.pct <= -(limitPctOf(r.code, r.name) - 0.35);
+/* 涨跌停判定：用「现价是否贴住按昨收算出的涨/跌停价」判断，而不是纯阈值。
+   原因：有些股票名称仍带 ST，但实际按 10% 限幅交易（摘帽未改名 / 退市整理期），
+   按 5% 阈值会把 -6.9% 这种误判成跌停。这里对 ST 同时试 5% 与 10%。 */
+function atLimit(r, dir){
+  if (r.pct == null || r.price == null) return false;
+  const prev = r.price / (1 + r.pct / 100);
+  if (!isFinite(prev) || prev <= 0) return false;
+  const code = String(r.code || '');
+  const st = /ST/i.test(r.name || '');
+  let cands;
+  if (/^(30|688|689)/.test(code)) cands = [20];
+  else if (/^(4|8|920)/.test(code)) cands = [30];
+  else cands = st ? [5, 10] : [10];
+  // 涨跌停的本质是「价格被钉在限价上」，不是「涨跌超过某阈值」
+  return cands.some(l => {
+    const lim = +(prev * (1 + dir * l / 100)).toFixed(2);
+    return Math.abs(r.price - lim) <= 0.012;     // 覆盖限价取整误差（低价股约 1 分钱）
+  });
+}
+const isLimitUp   = r => atLimit(r, 1);
+const isLimitDown = r => atLimit(r, -1);
 
 function marketStats(snap){
   const v = snap.filter(r => r.pct != null && r.price != null);
@@ -2115,11 +2538,14 @@ async function refreshMarket(force){
   if (btn) btn.textContent = '刷新中…';
   try {
     const idx = await indexQuotes();
+    S.idx = idx;                       // 供复盘报告使用
     const snap = await marketSnapshot(force);
     const st = marketStats(snap);
     let sectors = [], sectorDate = S.dataDate || isoToday();
     let liveSectors = null;
     sectors = await dcSectors(sectorDate).catch(() => []);
+    if (sectors.length && S.sectorDate) sectorDate = S.sectorDate;   // dcSectors 会往前回退找可用日期
+    S.sectors = sectors;
     /* 今日报表没生成 → 先用 ulist 的 90.BKxxxx 实时板块（1 个请求） */
     if (!sectors.length && !['weekend', 'pre'].includes(marketState().k)){
       liveSectors = await dcSectorsLive().catch(() => []);
@@ -2676,6 +3102,7 @@ function showTab(key){
   if (key === 'market' && Date.now() - lastMarketTs > 30000) refreshMarket();   // 切回大盘时若超过 30 秒就刷
 }
 function start(){
+  loadCalendar().then(ok => { if (ok) renderHeader(marketState()); });   // 日历到位后刷新状态栏
   initNotifyBtn();
   document.addEventListener('click', () => {
     if ('Notification' in window && Notification.permission === 'default') askNotify();
@@ -2696,7 +3123,7 @@ if (typeof window !== 'undefined' && !window.__EM_TEST__) start();
 if (typeof window !== 'undefined') {
   window.__APP__ = { jsonp, dcRank, dcUniverse, quoteBatch, kline, calcIndicators, stockNews,
                      tencentNames, refreshMkt, renderMkt, deltaOf, smartboxSearch, resolveCode,
-                     loadDossier, riskCheck, dcBasic, dcFinance, dcHolder, dcLift, dcPredict, dcLHB, fetchAnns, fundFlowDays, dcTopHolders, marketState, renderHeader, manualRefresh, autoOn,
+                     loadDossier, riskCheck, dcBasic, dcFinance, dcHolder, dcLift, dcPredict, dcLHB, fetchAnns, fundFlowDays, dcTopHolders, marketState, renderHeader, manualRefresh, autoOn, loadCalendar, fetchMonthCalendar, quoteBatchTencent, klineTencent, buildReviewMd,
                      dcSnapshot, marketSnapshot, liveSnapshot, indexQuotes, dcSectors, dcSectorsLive, boardCodes, dcSectorTrend, dcMargin, dcNorthbound, dcOrgSeats, styleSpread, marketStats, marketVerdict, refreshMarket,
                      runScreen, STRATS, techSnapshot, dcFinanceAll, finRiskOf, dcLiftSoon, unlockRiskOf, getScreenRows: () => screenRows, getDossier: () => dossierState, S };
 }
